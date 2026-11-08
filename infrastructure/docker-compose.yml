@@ -1,0 +1,123 @@
+name: medisense
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-medisense}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medisense}
+      POSTGRES_DB: ${POSTGRES_DB:-medisense}
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-medisense} -d ${POSTGRES_DB:-medisense}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mosquitto-init:
+    image: eclipse-mosquitto:2
+    user: root
+    restart: "no"
+    volumes:
+      - mosquitto-auth:/auth
+    environment:
+      MQTT_BACKEND_PASSWORD: ${MQTT_BACKEND_PASSWORD:-backend-secret}
+      MQTT_DEVICE_001_PASSWORD: ${MQTT_DEVICE_001_PASSWORD:-device-secret-001}
+      MQTT_DEVICE_002_PASSWORD: ${MQTT_DEVICE_002_PASSWORD:-device-secret-002}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        rm -f /auth/passwd
+        mosquitto_passwd -b -c /auth/passwd medi-backend "$$MQTT_BACKEND_PASSWORD"
+        mosquitto_passwd -b /auth/passwd ESP32-001 "$$MQTT_DEVICE_001_PASSWORD"
+        mosquitto_passwd -b /auth/passwd ESP32-002 "$$MQTT_DEVICE_002_PASSWORD"
+        chmod 644 /auth/passwd
+        echo "Mosquitto password file generated."
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    depends_on:
+      mosquitto-init:
+        condition: service_completed_successfully
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/acl:/mosquitto/config/acl:ro
+      - mosquitto-auth:/mosquitto/auth:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+      mosquitto:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      API_PREFIX: api/v1
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SWAGGER_ENABLED: "true"
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-medisense}:${POSTGRES_PASSWORD:-medisense}@postgres:5432/${POSTGRES_DB:-medisense}?schema=public
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev-access-secret-change-me-at-least-32-chars}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+      JWT_REFRESH_TTL_DAYS: ${JWT_REFRESH_TTL_DAYS:-30}
+      JWT_ISSUER: medisense
+      JWT_AUDIENCE: medisense-app
+      PAIRING_CODE_PEPPER: ${PAIRING_CODE_PEPPER:-dev-pairing-pepper-change-me}
+      PAIRING_CODE_TTL_MINUTES: ${PAIRING_CODE_TTL_MINUTES:-15}
+      PAIRING_ALLOW_DEVICE_CODE: ${PAIRING_ALLOW_DEVICE_CODE:-false}
+      EMAIL_OTP_PEPPER: ${EMAIL_OTP_PEPPER:-dev-email-otp-pepper-change-me}
+      EMAIL_OTP_TTL_MINUTES: ${EMAIL_OTP_TTL_MINUTES:-10}
+      EMAIL_OTP_MAX_ATTEMPTS: ${EMAIL_OTP_MAX_ATTEMPTS:-5}
+      EMAIL_OTP_RESEND_COOLDOWN_SECONDS: ${EMAIL_OTP_RESEND_COOLDOWN_SECONDS:-60}
+      MAIL_TRANSPORT: smtp
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_SECURE: "false"
+      SMTP_FROM: "${SMTP_FROM:-MediSense <no-reply@medisense.local>}"
+      MQTT_ENABLED: "true"
+      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_USERNAME: medi-backend
+      MQTT_PASSWORD: ${MQTT_BACKEND_PASSWORD:-backend-secret}
+      MQTT_CLIENT_ID: medisense-backend
+      MQTT_TOPIC_PREFIX: medisense
+      MQTT_REJECT_UNAUTHORIZED: "false"
+      DEVICE_OFFLINE_THRESHOLD_SECONDS: ${DEVICE_OFFLINE_THRESHOLD_SECONDS:-90}
+      DEVICE_SWEEPER_INTERVAL_MS: ${DEVICE_SWEEPER_INTERVAL_MS:-30000}
+    ports:
+      - "${BACKEND_PORT:-3000}:3000"
+
+volumes:
+  postgres-data:
+  mosquitto-auth:
+  mosquitto-data:
+  mosquitto-log:

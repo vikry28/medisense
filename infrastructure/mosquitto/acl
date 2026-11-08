@@ -1,0 +1,10 @@
+# Backend can read all telemetry/status and publish downlink commands.
+user medi-backend
+topic read medisense/device/+/telemetry
+topic read medisense/device/+/status
+topic write medisense/device/+/command
+
+# Each device may only publish to its own topics.
+pattern write medisense/device/%u/telemetry
+pattern write medisense/device/%u/status
+pattern read medisense/device/%u/command

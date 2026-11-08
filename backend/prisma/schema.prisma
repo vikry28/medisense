@@ -1,0 +1,196 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum DeviceStatus {
+  ONLINE
+  OFFLINE
+}
+
+enum SignalQuality {
+  GOOD
+  FAIR
+  POOR
+}
+
+enum AlertParameter {
+  HEART_RATE
+  SPO2
+  TEMPERATURE
+}
+
+enum AlertDirection {
+  LOW
+  HIGH
+}
+
+enum AlertStatus {
+  UNREAD
+  READ
+}
+
+model User {
+  id              String    @id @default(uuid()) @db.Uuid
+  name            String    @db.VarChar(100)
+  email           String    @unique @db.VarChar(255)
+  passwordHash    String    @map("password_hash") @db.VarChar(255)
+  role            UserRole  @default(USER)
+  timezone        String    @default("Asia/Jakarta") @db.VarChar(64)
+  emailVerifiedAt DateTime? @map("email_verified_at") @db.Timestamptz(3)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  refreshTokens          RefreshToken[]
+  emailVerificationCodes EmailVerificationCode[]
+  assignments            DeviceAssignment[]
+  alertConfigs           AlertConfig[]
+  measurements           Measurement[]
+  alerts                 Alert[]
+
+  @@map("users")
+}
+
+model EmailVerificationCode {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  codeHash   String    @map("code_hash") @db.VarChar(64)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(3)
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("email_verification_codes")
+}
+
+model RefreshToken {
+  id                String    @id @default(uuid()) @db.Uuid
+  userId            String    @map("user_id") @db.Uuid
+  tokenHash         String    @unique @map("token_hash") @db.VarChar(64)
+  familyId          String    @map("family_id") @db.Uuid
+  expiresAt         DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt         DateTime? @map("revoked_at") @db.Timestamptz(3)
+  replacedByTokenId String?   @map("replaced_by_token_id") @db.Uuid
+  ip                String?   @db.VarChar(64)
+  userAgent         String?   @map("user_agent") @db.VarChar(255)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+model Device {
+  id                   String       @id @default(uuid()) @db.Uuid
+  deviceCode           String       @unique @map("device_code") @db.VarChar(64)
+  name                 String       @db.VarChar(100)
+  type                 String       @default("ESP32") @db.VarChar(64)
+  status               DeviceStatus @default(OFFLINE)
+  firmwareVersion      String?      @map("firmware_version") @db.VarChar(32)
+  pairingCodeHash      String?      @map("pairing_code_hash") @db.VarChar(64)
+  pairingCodeExpiresAt DateTime?    @map("pairing_code_expires_at") @db.Timestamptz(3)
+  lastSeenAt           DateTime?    @map("last_seen_at") @db.Timestamptz(3)
+  createdAt            DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  assignments  DeviceAssignment[]
+  measurements Measurement[]
+  alerts       Alert[]
+
+  @@index([status, lastSeenAt])
+  @@map("devices")
+}
+
+model DeviceAssignment {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  deviceId     String    @map("device_id") @db.Uuid
+  assignedAt   DateTime  @default(now()) @map("assigned_at") @db.Timestamptz(3)
+  unassignedAt DateTime? @map("unassigned_at") @db.Timestamptz(3)
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([userId, unassignedAt])
+  @@index([deviceId, unassignedAt])
+  @@map("device_assignments")
+}
+
+model Measurement {
+  id            String        @id @default(uuid()) @db.Uuid
+  deviceId      String        @map("device_id") @db.Uuid
+  userId        String        @map("user_id") @db.Uuid
+  messageId     String        @map("message_id") @db.VarChar(64)
+  sequence      BigInt?
+  heartRate     Int?          @map("heart_rate")
+  spo2          Int?
+  temperature   Decimal?      @db.Decimal(4, 2)
+  signalQuality SignalQuality @default(GOOD) @map("signal_quality")
+  measuredAt    DateTime      @map("measured_at") @db.Timestamptz(3)
+  receivedAt    DateTime      @default(now()) @map("received_at") @db.Timestamptz(3)
+
+  device Device  @relation(fields: [deviceId], references: [id], onDelete: Restrict)
+  user   User    @relation(fields: [userId], references: [id], onDelete: Restrict)
+  alerts Alert[]
+
+  @@unique([deviceId, messageId])
+  @@index([userId, measuredAt(sort: Desc)])
+  @@index([deviceId, measuredAt(sort: Desc)])
+  @@index([userId, heartRate])
+  @@index([userId, spo2])
+  @@map("measurements")
+}
+
+model AlertConfig {
+  id        String         @id @default(uuid()) @db.Uuid
+  userId    String         @map("user_id") @db.Uuid
+  parameter AlertParameter
+  minValue  Decimal?       @map("min_value") @db.Decimal(6, 2)
+  maxValue  Decimal?       @map("max_value") @db.Decimal(6, 2)
+  enabled   Boolean        @default(true)
+  updatedAt DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, parameter])
+  @@map("alert_configs")
+}
+
+model Alert {
+  id            String         @id @default(uuid()) @db.Uuid
+  userId        String         @map("user_id") @db.Uuid
+  deviceId      String         @map("device_id") @db.Uuid
+  measurementId String         @map("measurement_id") @db.Uuid
+  parameter     AlertParameter
+  value         Decimal        @db.Decimal(6, 2)
+  minValue      Decimal?       @map("min_value") @db.Decimal(6, 2)
+  maxValue      Decimal?       @map("max_value") @db.Decimal(6, 2)
+  direction     AlertDirection
+  status        AlertStatus    @default(UNREAD)
+  message       String         @db.VarChar(255)
+  createdAt     DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  readAt        DateTime?      @map("read_at") @db.Timestamptz(3)
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device      Device      @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  measurement Measurement @relation(fields: [measurementId], references: [id], onDelete: Cascade)
+
+  @@unique([measurementId, parameter])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, status])
+  @@map("alerts")
+}
