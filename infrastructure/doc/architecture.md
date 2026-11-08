@@ -15,10 +15,11 @@ MQTT contracts live in [`api-specification.md`](./api-specification.md).
 | Area | Status |
 | --- | --- |
 | REST API (auth, users, devices, measurements, alerts, health) | Implemented |
+| Email verification via 6-digit OTP | Implemented |
 | PostgreSQL schema + migrations + seed | Implemented |
 | MQTT ingestion (telemetry + device status/LWT) | Implemented |
 | Socket.IO real-time gateway | Implemented |
-| Docker Compose (PostgreSQL, Mosquitto, backend) | Implemented |
+| Docker Compose (PostgreSQL, Mailpit, Mosquitto, backend) | Implemented |
 | Unit tests | Implemented |
 | Database-backed e2e tests | Spec included, opt-in via `TEST_DATABASE_URL` |
 | PDF export, push notifications, caregiver/admin | Out of scope |
@@ -123,7 +124,8 @@ API and never receive user tokens.
 
 | Module | Responsibility |
 | --- | --- |
-| `AuthModule` | Register, login, refresh rotation, logout, JWT signing |
+| `AuthModule` | Register, email OTP verification, login, refresh rotation, logout, JWT signing |
+| `MailModule` | Console/SMTP delivery of verification emails |
 | `UsersModule` | Profile read/update, password change |
 | `DevicesModule` | Pairing, unpairing, rename, presence sweeper |
 | `MeasurementsModule` | Telemetry ingestion, history, latest, series |
@@ -149,9 +151,9 @@ Cross-cutting behaviour:
 
 ### 3.4 PostgreSQL
 
-PostgreSQL is the system of record for users, sessions, devices, assignments,
-measurements, thresholds and alerts. Prisma provides the typed client and
-migrations. The schema is described in section 6.
+PostgreSQL is the system of record for users, email verification codes, sessions,
+devices, assignments, measurements, thresholds and alerts. Prisma provides the
+typed client and migrations. The schema is described in section 6.
 
 ### 3.5 Flutter client
 
@@ -237,22 +239,44 @@ Default thresholds (seeded and used as fallback when a row is missing):
 
 Thresholds are a demonstration feature, not a clinical alarm system.
 
-### 4.3 Authentication and session rotation
+### 4.3 Authentication, email verification and session rotation
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant C as Client
   participant A as AuthController
+  participant V as EmailVerificationService
+  participant M as MailService
   participant T as TokenService
   participant P as PostgreSQL
+
+  C->>A: POST /auth/register {name, email, password}
+  A->>P: INSERT user (email_verified_at = NULL)
+  A->>V: issueForUser(user)
+  V->>P: INSERT email_verification_code (HMAC hash, expires_at)
+  V->>M: sendEmailVerificationOtp(to, otp)
+  M-->>C: 6-digit code (Mailpit or SMTP)
+  A-->>C: 201 {user, verificationRequired: true}
 
   C->>A: POST /auth/login {email, password}
   A->>P: load user
   A->>A: verify Argon2id hash
+  alt email not verified
+    A-->>C: 403 AUTH_EMAIL_NOT_VERIFIED
+  else verified
+    A->>T: issueTokenPair(user)
+    T->>P: INSERT refresh_tokens (hash, family_id, expires_at)
+    T-->>C: access JWT (15 min) + opaque refresh token (30 days)
+  end
+
+  C->>A: POST /auth/verify-email {email, otp}
+  A->>V: verify(email, otp)
+  V->>P: load latest unconsumed code
+  V->>V: constant-time HMAC compare, expiry and attempt checks
+  V->>P: consume codes, set email_verified_at
   A->>T: issueTokenPair(user)
-  T->>P: INSERT refresh_tokens (hash, family_id, expires_at)
-  T-->>C: access JWT (15 min) + opaque refresh token (30 days)
+  T-->>C: access + refresh token
 
   C->>A: POST /auth/refresh {refreshToken}
   A->>T: rotate(refreshToken)
@@ -270,6 +294,14 @@ sequenceDiagram
 
 Properties:
 
+- Registration never returns tokens. A 6-digit OTP is emailed and only its
+  HMAC-SHA256 hash (`userId:otp`, `EMAIL_OTP_PEPPER`) is stored.
+- Codes expire after `EMAIL_OTP_TTL_MINUTES` (default 10), allow
+  `EMAIL_OTP_MAX_ATTEMPTS` failures (default 5), and resend is limited to one
+  code per `EMAIL_OTP_RESEND_COOLDOWN_SECONDS` (default 60).
+- `POST /auth/verify-email` consumes every outstanding code and issues a token
+  pair immediately. `POST /auth/resend-verification` always returns the same
+  generic response so account existence cannot be enumerated.
 - Access tokens are short-lived JWTs signed with `JWT_ACCESS_SECRET`
   (HS256) and include `sub`, `email`, `role`, `iss`, `aud`.
 - Refresh tokens are opaque random strings. Only their SHA-256 hash is stored.
@@ -387,6 +419,7 @@ flowchart TD
 
   AUTH --> USERS
   AUTH --> ALERTS
+  AUTH --> MAIL[MailModule]
   MEAS --> DEVICES
   MEAS --> ALERTS
   MQTT --> MEAS
@@ -444,6 +477,12 @@ Joi validates the environment at boot. Important constraints:
 - `DATABASE_URL` is required.
 - `JWT_ACCESS_SECRET` must be at least 32 characters.
 - `PAIRING_CODE_PEPPER` must be at least 16 characters.
+- `EMAIL_OTP_PEPPER` must be at least 16 characters.
+- `MAIL_TRANSPORT` accepts `console` (default) or `smtp`; `SMTP_HOST`,
+  `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD` and `SMTP_FROM`
+  configure delivery.
+- `EMAIL_OTP_TTL_MINUTES` (default 10), `EMAIL_OTP_MAX_ATTEMPTS` (default 5) and
+  `EMAIL_OTP_RESEND_COOLDOWN_SECONDS` (default 60) tune the OTP policy.
 - Unknown environment variables are allowed (so the container runtime can add
   its own), but every documented variable is type-checked and defaulted.
 - Validation failure aborts startup with a clear error.
@@ -455,6 +494,7 @@ Joi validates the environment at boot. Important constraints:
 ```mermaid
 erDiagram
   USERS ||--o{ REFRESH_TOKENS : owns
+  USERS ||--o{ EMAIL_VERIFICATION_CODES : verifies
   USERS ||--o{ DEVICE_ASSIGNMENTS : has
   DEVICES ||--o{ DEVICE_ASSIGNMENTS : assigned
   USERS ||--o{ MEASUREMENTS : owns
@@ -471,8 +511,19 @@ erDiagram
     varchar password_hash
     enum role
     varchar timezone
+    timestamptz email_verified_at
     timestamptz created_at
     timestamptz updated_at
+  }
+
+  EMAIL_VERIFICATION_CODES {
+    uuid id PK
+    uuid user_id FK
+    varchar code_hash
+    timestamptz expires_at
+    timestamptz consumed_at
+    int attempts
+    timestamptz created_at
   }
 
   REFRESH_TOKENS {
@@ -553,6 +604,13 @@ erDiagram
 
 ### 6.1 Design decisions
 
+**Email verification codes.** `users.email_verified_at` gates login. Each code
+row stores an HMAC-SHA256 hash of `<user_id>:<otp>` (never the raw OTP), an
+expiry, an attempt counter and a `consumed_at` marker. A new code consumes all
+older codes for the user, and successful verification consumes the rest.
+Existing accounts are backfilled as verified by the migration so they are not
+locked out.
+
 **`user_id` on measurements and alerts.** The active assignment is enough to
 authorize ingestion, but denormalizing the owner onto each row means history
 queries never need to join through `device_assignments`, and history survives an
@@ -594,6 +652,8 @@ on `(user_id, heart_rate)` and `(user_id, spo2)` support future filtering.
 | Password storage | Argon2id (`@node-rs/argon2`, memory 19 MiB, 2 iterations) |
 | Access tokens | Short-lived HS256 JWT, issuer/audience checked |
 | Refresh tokens | 384-bit random, SHA-256 hashed at rest, rotated, reuse detection |
+| Email verification | 6-digit OTP, HMAC-SHA256 with pepper, 10 min TTL, 5 attempts, 60 s resend cooldown, constant-time compare |
+| Account enumeration | Generic resend response and identical invalid-credential message |
 | Pairing codes | HMAC-SHA256 with pepper, expiry, cleared after use |
 | Authorization | Every device/measurement/alert query scoped by `user_id` |
 | Cross-account access | Returns `404` (does not reveal resource existence) |
@@ -634,6 +694,7 @@ Security notes and deliberate trade-offs:
 | Duplicate telemetry | Ignored via unique `(device_id, message_id)` |
 | Device disconnects | LWT marks it offline; sweeper is the fallback |
 | Refresh token reuse | Entire token family revoked; client must log in again |
+| Mail provider unavailable | Verification email failure is logged; registration/resend still succeed and the client can retry |
 | WebSocket disconnect | Client reconnects and re-subscribes; no server-side state is lost |
 | Sudden process exit | In-flight MQTT messages are redelivered (QoS 1) and deduped |
 
@@ -651,13 +712,16 @@ flowchart TB
     PG[("postgres:18-alpine<br/>volume postgres-data<br/>host :5433")]
     MINIT["mosquitto-init<br/>one-shot password file"]
     MQ["eclipse-mosquitto:2<br/>host :1883"]
-    BE["backend<br/>multi-stage Node 22<br/>host :3000"]
+    MAIL["mailpit<br/>SMTP :1025<br/>UI :8025"]
+    BE["backend<br/>multi-stage Node 26<br/>host :3000"]
   end
   DEV["ESP32 / simulator"] --> MQ
   BE --> MQ
   BE --> PG
+  BE --> MAIL
   MINIT --> MQ
   USER["Flutter / browser / curl"] --> BE
+  USER --> MAIL
 ```
 
 ### 9.1 Services
@@ -665,12 +729,19 @@ flowchart TB
 | Service | Image | Ports | Notes |
 | --- | --- | --- | --- |
 | `postgres` | `postgres:18-alpine` | `5433:5432` | Healthcheck via `pg_isready`; named volume |
+| `mailpit` | `axllent/mailpit:latest` | `1025:1025`, `8025:8025` | Development SMTP sink and web UI for verification emails |
 | `mosquitto-init` | `eclipse-mosquitto:2` | none | Generates `passwd` from env, exits |
 | `mosquitto` | `eclipse-mosquitto:2` | `1883:1883` | Config, ACL and passwd mounted read-only |
 | `backend` | built from `backend/Dockerfile` | `3000:3000` | Runs `prisma migrate deploy` then `node dist/main.js` |
 
 The host PostgreSQL port defaults to **5433** to avoid clashing with an existing
 local PostgreSQL on 5432.
+
+In development the backend sends verification emails to Mailpit
+(`MAIL_TRANSPORT=smtp`, `SMTP_HOST=mailpit`, `SMTP_PORT=1025`). Open
+`http://localhost:8025` to read the OTP. When the backend runs outside Compose,
+the default `MAIL_TRANSPORT=console` writes the code to the application log
+instead.
 
 ### 9.2 Backend image
 
@@ -679,7 +750,7 @@ Multi-stage build:
 1. `deps`: installs all dependencies (including the Prisma and Nest CLIs), copies
    the Prisma schema, generates the client.
 2. `build`: compiles TypeScript to `dist`.
-3. `runtime`: minimal Node 22 Alpine image, non-root `nestjs` user, copies only
+3. `runtime`: minimal Node 26 Alpine image, non-root `nestjs` user, copies only
    `dist`, `node_modules`, `prisma` and `package.json`, adds a `HEALTHCHECK`
    against `/health/live`.
 
@@ -700,7 +771,10 @@ manual (`docker compose exec backend npx prisma db seed`).
 
 ### 9.4 Production hardening checklist
 
-- Replace every default secret in `infrastructure/.env`.
+- Replace every default secret in `infrastructure/.env`, including
+  `EMAIL_OTP_PEPPER`.
+- Do not expose Mailpit publicly; use a real SMTP provider over TLS and remove
+  the `mailpit` service from production deployments.
 - Set `PAIRING_ALLOW_DEVICE_CODE=false`.
 - Terminate TLS at a reverse proxy; use `mqtts://` and set
   `MQTT_REJECT_UNAUTHORIZED=true`.

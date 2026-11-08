@@ -52,6 +52,10 @@ Then:
 - Swagger: <http://localhost:3000/docs>
 - Readiness: <http://localhost:3000/health/ready>
 - MQTT broker: `mqtt://localhost:1883`
+- Mailpit (verification emails): <http://localhost:8025>
+
+New accounts must verify their email with a 6-digit code before they can log in.
+In the Compose stack the code is delivered to Mailpit.
 
 Demo credentials created by the seed:
 
@@ -60,13 +64,14 @@ email:    demo@medisense.local
 password: Demo1234!
 ```
 
-`ESP32-001` is pre-paired with the demo user. `ESP32-002` is unpaired with
-pairing code `123456`.
+The demo account is already email-verified. `ESP32-001` is pre-paired with the
+demo user. `ESP32-002` is unpaired with pairing code `123456`.
 
 ## Implemented scope
 
 - Email/password auth with Argon2id, JWT access tokens and rotating refresh
   token families
+- Email verification with expiring 6-digit OTP codes (Mailpit/SMTP in development)
 - User profile and password management
 - Device pairing, pairing-code regeneration, rename and unpair
 - MQTT telemetry ingestion with validation, idempotency and presence tracking

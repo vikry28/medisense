@@ -21,12 +21,13 @@ Related documents:
 
 | Layer | Technology |
 | --- | --- |
-| Runtime | Node.js 22 LTS, TypeScript 5.9 |
+| Runtime | Node.js 26 LTS, TypeScript 5.9 |
 | Framework | NestJS 11 (Express) |
 | Database | PostgreSQL 18, Prisma 6 |
 | Real-time | Socket.IO 4 |
 | IoT | MQTT 5 (`mqtt` package), Eclipse Mosquitto 2 |
-| Auth | Argon2id, JWT access token + rotating opaque refresh token |
+| Auth | Argon2id, JWT access token + rotating opaque refresh token, email OTP verification |
+| Mail | nodemailer (`console` or `smtp` transport) |
 | Validation | class-validator / class-transformer |
 | Documentation | Swagger / OpenAPI at `/docs` |
 | Logging | pino (`nestjs-pino`) with secret redaction |
@@ -58,6 +59,10 @@ Then:
 - API: <http://localhost:3000/api/v1>
 - Swagger: <http://localhost:3000/docs>
 - Readiness: <http://localhost:3000/health/ready>
+- Mailpit (verification emails): <http://localhost:8025>
+
+New registrations must verify their email before they can log in. In the
+Compose stack, the 6-digit code is delivered to Mailpit.
 
 Demo account created by the seed:
 
@@ -65,6 +70,9 @@ Demo account created by the seed:
 email:    demo@medisense.local
 password: Demo1234!
 ```
+
+The demo account is seeded as already verified, so login returns tokens
+immediately.
 
 Seeded devices:
 
@@ -77,7 +85,7 @@ Seeded devices:
 
 ## Local development (without Docker)
 
-Requirements: Node.js 22+, PostgreSQL 14+ (for `date_bin`), Mosquitto 2+.
+Requirements: Node.js 26+ (see `.nvmrc`), PostgreSQL 14+ (for `date_bin`), Mosquitto 2+.
 
 ```bash
 cp .env.example .env
@@ -88,6 +96,9 @@ npm run start:dev
 ```
 
 The default `.env` expects PostgreSQL on `localhost:5433` and MQTT on `localhost:1883`.
+`MAIL_TRANSPORT=console` writes verification codes to the application log, so a
+local SMTP server is optional. To use Mailpit from Compose while the API runs on
+the host, set `MAIL_TRANSPORT=smtp`, `SMTP_HOST=localhost` and `SMTP_PORT=1025`.
 
 If you run only PostgreSQL/Mosquitto from Compose while the API runs on the host, use:
 
@@ -108,6 +119,15 @@ See `.env.example`. Important values:
 | `JWT_REFRESH_TTL_DAYS` | `30` | Refresh token lifetime |
 | `PAIRING_CODE_PEPPER` | dev pepper | Must match the seed when generating pairing codes |
 | `PAIRING_ALLOW_DEVICE_CODE` | `true` in `.env.example` | Allow pairing with `deviceCode` alone; **must be `false` in production** |
+| `EMAIL_OTP_PEPPER` | dev pepper | Minimum 16 characters; HMAC key for stored OTP hashes |
+| `EMAIL_OTP_TTL_MINUTES` | `10` | Verification code lifetime |
+| `EMAIL_OTP_MAX_ATTEMPTS` | `5` | Failed attempts before a code is locked |
+| `EMAIL_OTP_RESEND_COOLDOWN_SECONDS` | `60` | Minimum wait between resends |
+| `MAIL_TRANSPORT` | `console` | `console` logs the OTP; `smtp` sends email |
+| `SMTP_HOST` / `SMTP_PORT` | `localhost` / `1025` | SMTP server (Mailpit in Compose) |
+| `SMTP_SECURE` | `false` | Use TLS for SMTP |
+| `SMTP_USER` / `SMTP_PASSWORD` | empty | Optional SMTP credentials |
+| `SMTP_FROM` | `MediSense <no-reply@medisense.local>` | Sender address |
 | `MQTT_ENABLED` | `true` | Set `false` to run REST/WS without a broker |
 | `MQTT_URL` | `mqtt://localhost:1883` | Use `mqtts://` plus `MQTT_REJECT_UNAUTHORIZED=true` in production |
 | `MQTT_TOPIC_PREFIX` | `medisense` | Topic namespace |
@@ -122,13 +142,31 @@ Base path: `/api/v1`. Success responses use `{ "data": ..., "meta": ... }`; erro
 
 | Method | Path | Description |
 | --- | --- | --- |
-| POST | `/auth/register` | Register and receive tokens |
-| POST | `/auth/login` | Email + password login |
+| POST | `/auth/register` | Create an account and send a verification OTP (no tokens) |
+| POST | `/auth/verify-email` | Verify with `{ email, otp }` and receive tokens |
+| POST | `/auth/resend-verification` | Send a new OTP after the cooldown |
+| POST | `/auth/login` | Email + password login (403 until verified) |
 | POST | `/auth/refresh` | Rotate refresh token |
 | POST | `/auth/logout` | Revoke one refresh token |
 | POST | `/auth/logout-all` | Revoke every session for the current user |
 
 Refresh tokens are opaque, hashed at rest, rotated on use, and protected by reuse detection (reuse revokes the whole token family).
+
+#### Email verification
+
+1. `POST /auth/register` creates the user with `emailVerified: false`, stores an
+   HMAC-SHA256 hash of a 6-digit code, and sends the code.
+2. Read the code from Mailpit (<http://localhost:8025>) or the backend log.
+3. `POST /auth/verify-email` with `{ "email": "...", "otp": "123456" }` marks the
+   account verified and returns `{ user, tokens }`.
+4. Unverified accounts receive `403 AUTH_EMAIL_NOT_VERIFIED` on login. The error
+   includes `resendAfterSeconds` so the client can offer a resend.
+
+Codes expire after `EMAIL_OTP_TTL_MINUTES`, allow `EMAIL_OTP_MAX_ATTEMPTS`
+failures, and can be resent after `EMAIL_OTP_RESEND_COOLDOWN_SECONDS`. The resend
+endpoint returns the same response for unknown and verified emails to prevent
+account enumeration. Mail delivery failures are logged and do not fail
+registration; the client should retry the resend.
 
 ### Users
 
@@ -277,8 +315,9 @@ Clients automatically join `user:{userId}` on connect; measurements require an e
 
 `prisma/schema.prisma` contains:
 
-- `users`
+- `users` (includes `email_verified_at`)
 - `refresh_tokens`
+- `email_verification_codes` (hashed OTP, expiry, attempts)
 - `devices`
 - `device_assignments` (partial unique index enforces one active assignment per device)
 - `measurements`
@@ -295,7 +334,8 @@ src/
 ├── config/          # environment validation (Joi)
 ├── prisma/          # PrismaService
 └── modules/
-    ├── auth/        # register/login/refresh/logout
+    ├── auth/        # register, email verification, login, refresh, logout
+    ├── mail/        # console/SMTP verification email delivery
     ├── users/       # profile + password
     ├── devices/     # pairing, presence sweeper
     ├── measurements/# history, series, telemetry ingestion
@@ -325,7 +365,7 @@ DATABASE_URL=postgresql://medisense:medisense@localhost:5433/medisense_test npx 
 TEST_DATABASE_URL=postgresql://medisense:medisense@localhost:5433/medisense_test npm run test:e2e
 ```
 
-Current unit coverage includes the alert evaluator, telemetry validation and pagination cursors.
+Current unit coverage includes the alert evaluator, telemetry validation, pagination cursors and email verification (OTP helpers and service).
 
 ## Security notes
 
@@ -339,6 +379,9 @@ Current unit coverage includes the alert evaluator, telemetry validation and pag
 - Pairing codes are stored as HMAC-SHA256 hashes and expire. Development pairing
   by `deviceCode` is opt-in through `PAIRING_ALLOW_DEVICE_CODE` and must be
   disabled in production.
+- Email verification codes are stored as HMAC-SHA256 hashes (peppered), expire
+  after 10 minutes, lock after 5 failed attempts and are compared in constant
+  time. Resend responses are generic to prevent account enumeration.
 
 Before production: change all development secrets, enable MQTT TLS, run multiple instances behind a shared rate limiter (Redis), add a Redis adapter for Socket.IO, add backup/retention policies, and review healthcare data compliance requirements.
 

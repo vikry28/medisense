@@ -4,6 +4,10 @@
   "description": "MediSense real-time health monitoring backend (REST + MQTT + WebSocket)",
   "private": true,
   "license": "UNLICENSED",
+  "engines": {
+    "node": ">=26.0.0",
+    "npm": ">=11.0.0"
+  },
   "scripts": {
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"prisma/**/*.ts\"",

@@ -127,7 +127,14 @@ export class EmailVerificationService {
       orderBy: { createdAt: "desc" },
     });
 
-    if (!code || isOtpExpired(code.expiresAt)) {
+    if (!code) {
+      throw AppException.badRequest(
+        ERROR_CODES.OTP_INVALID,
+        "The verification code is invalid.",
+      );
+    }
+
+    if (isOtpExpired(code.expiresAt)) {
       throw AppException.badRequest(
         ERROR_CODES.OTP_EXPIRED,
         "The verification code has expired. Request a new code.",

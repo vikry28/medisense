@@ -24,6 +24,8 @@ the MQTT device protocol implemented by the backend.
 | Swagger UI | `http://localhost:3000/docs` |
 | Socket.IO | `http://localhost:3000/realtime` (namespace) |
 | MQTT broker | `mqtt://localhost:1883` |
+| Mailpit UI (development) | `http://localhost:8025` |
+| SMTP sink (development) | `localhost:1025` |
 
 The health endpoints are intentionally excluded from the `/api/v1` prefix so
 orchestrators can probe them without knowing the API version.
@@ -34,6 +36,8 @@ All endpoints except the following require a Bearer access token:
 
 - `POST /auth/register`
 - `POST /auth/login`
+- `POST /auth/verify-email`
+- `POST /auth/resend-verification`
 - `POST /auth/refresh`
 - `GET /health/live`
 - `GET /health/ready`
@@ -131,6 +135,12 @@ Collections add pagination metadata:
 | `AUTH_REFRESH_EXPIRED` | 401 | Refresh token expired |
 | `AUTH_REFRESH_REUSED` | 401 | Revoked refresh token reused; family revoked |
 | `AUTH_EMAIL_TAKEN` | 409 | Email already registered |
+| `AUTH_EMAIL_NOT_VERIFIED` | 403 | Login rejected until the email address is verified |
+| `AUTH_EMAIL_ALREADY_VERIFIED` | 409 | Verification attempted for an already verified email |
+| `AUTH_OTP_INVALID` | 400 | Verification code is wrong or no code was issued |
+| `AUTH_OTP_EXPIRED` | 400 | Verification code has expired |
+| `AUTH_OTP_TOO_MANY_ATTEMPTS` | 429 | Too many invalid code attempts; request a new code |
+| `AUTH_OTP_RESEND_TOO_SOON` | 429 | Resend requested inside the cooldown window |
 | `FORBIDDEN` | 403 | Authenticated but not allowed |
 | `NOT_FOUND` | 404 | Generic resource not found |
 | `CONFLICT` | 409 | Generic unique-constraint conflict |
@@ -173,6 +183,8 @@ Rate limits are per client IP per minute.
 | Global default | 100 requests/min |
 | `POST /auth/register` | 5 requests/min |
 | `POST /auth/login` | 10 requests/min |
+| `POST /auth/verify-email` | 10 requests/min |
+| `POST /auth/resend-verification` | 3 requests/min |
 | `POST /auth/refresh` | 30 requests/min |
 
 Exceeding a limit returns `429` with `code: "RATE_LIMITED"`.
@@ -215,25 +227,37 @@ Response `201 Created`:
       "email": "demo@medisense.local",
       "role": "USER",
       "timezone": "Asia/Jakarta",
+      "emailVerified": false,
       "createdAt": "2026-11-07T10:00:00.000Z",
       "updatedAt": "2026-11-07T10:00:00.000Z"
     },
-    "tokens": {
-      "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-      "refreshToken": "P7bq...opaque...",
-      "tokenType": "Bearer",
-      "expiresIn": 900
-    }
+    "verificationRequired": true,
+    "resendAfterSeconds": 60
   }
 }
 ```
+
+Registration does **not** issue tokens. The backend creates a 6-digit
+verification code, stores only its HMAC-SHA256 hash, and emails the code:
+
+- Development with `MAIL_TRANSPORT=console`: the code is written to the backend
+  log.
+- Development with the Compose stack: the code is delivered to Mailpit
+  (`http://localhost:8025`).
+- Production: set `MAIL_TRANSPORT=smtp` and the `SMTP_*` variables.
+
+The code is valid for `EMAIL_OTP_TTL_MINUTES` (default 10 minutes) and can be
+attempted `EMAIL_OTP_MAX_ATTEMPTS` times (default 5). Resending is allowed after
+`EMAIL_OTP_RESEND_COOLDOWN_SECONDS` (default 60 seconds). Registration also
+creates the three default alert configurations.
 
 Errors:
 
 - `409 AUTH_EMAIL_TAKEN`
 - `400 VALIDATION_ERROR`
 
-Registration also creates the three default alert configurations.
+If the mail provider is temporarily unavailable the request still succeeds; the
+failure is logged and the client can call `/auth/resend-verification`.
 
 ### 2.2 Login
 
@@ -251,15 +275,126 @@ Request:
 }
 ```
 
-Response `200 OK`: same `{ data: { user, tokens } }` shape as register.
+Response `200 OK`: same `{ data: { user, tokens } }` shape used by the verify
+endpoint, with `user.emailVerified: true`.
 
 Errors:
 
 - `401 AUTH_INVALID_CREDENTIALS` (same message for unknown email and wrong
   password)
+- `403 AUTH_EMAIL_NOT_VERIFIED` when the password is correct but the email has
+  not been verified:
+
+  ```json
+  {
+    "type": "about:blank",
+    "title": "Forbidden",
+    "status": 403,
+    "detail": "Please verify your email address before logging in.",
+    "code": "AUTH_EMAIL_NOT_VERIFIED",
+    "details": {
+      "email": "demo@medisense.local",
+      "resendAfterSeconds": 60
+    }
+  }
+  ```
+
 - `429 RATE_LIMITED`
 
-### 2.3 Refresh
+### 2.3 Verify email
+
+```http
+POST /api/v1/auth/verify-email
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "email": "demo@medisense.local",
+  "otp": "123456"
+}
+```
+
+| Field | Type | Rules |
+| --- | --- | --- |
+| `email` | string | Valid email, max 255; normalized to lowercase |
+| `otp` | string | Exactly 6 digits |
+
+Response `200 OK`:
+
+```json
+{
+  "data": {
+    "user": {
+      "id": "0f1b8a6e-4b1a-4b1a-9b1a-1a2b3c4d5e6f",
+      "name": "Demo User",
+      "email": "demo@medisense.local",
+      "role": "USER",
+      "timezone": "Asia/Jakarta",
+      "emailVerified": true,
+      "createdAt": "2026-11-07T10:00:00.000Z",
+      "updatedAt": "2026-11-07T10:00:00.000Z"
+    },
+    "tokens": {
+      "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+      "refreshToken": "P7bq...opaque...",
+      "tokenType": "Bearer",
+      "expiresIn": 900
+    }
+  }
+}
+```
+
+A successful verification marks the email as verified, consumes every
+outstanding code for the user, and immediately issues a token pair so the client
+does not need a second login round-trip.
+
+Errors:
+
+- `400 AUTH_OTP_INVALID` (also returned for unknown email addresses)
+- `400 AUTH_OTP_EXPIRED`
+- `409 AUTH_EMAIL_ALREADY_VERIFIED`
+- `429 AUTH_OTP_TOO_MANY_ATTEMPTS`
+- `429 RATE_LIMITED`
+
+### 2.4 Resend verification code
+
+```http
+POST /api/v1/auth/resend-verification
+Content-Type: application/json
+```
+
+Request:
+
+```json
+{
+  "email": "demo@medisense.local"
+}
+```
+
+Response `200 OK`:
+
+```json
+{
+  "data": {
+    "sent": true,
+    "resendAfterSeconds": 60
+  }
+}
+```
+
+The response is intentionally identical for unknown, already verified and
+unverified addresses so the endpoint cannot be used to enumerate accounts. A new
+code invalidates the previous one.
+
+Errors:
+
+- `429 AUTH_OTP_RESEND_TOO_SOON` with `details.retryAfterSeconds`
+- `429 RATE_LIMITED`
+
+### 2.5 Refresh
 
 ```http
 POST /api/v1/auth/refresh
@@ -297,7 +432,7 @@ Errors:
 - `401 AUTH_REFRESH_EXPIRED`
 - `401 AUTH_REFRESH_REUSED`
 
-### 2.4 Logout
+### 2.6 Logout
 
 ```http
 POST /api/v1/auth/logout
@@ -315,7 +450,7 @@ Request:
 
 Response `204 No Content`.
 
-### 2.5 Logout all sessions
+### 2.7 Logout all sessions
 
 ```http
 POST /api/v1/auth/logout-all
@@ -346,6 +481,7 @@ Response `200 OK`:
     "email": "demo@medisense.local",
     "role": "USER",
     "timezone": "Asia/Jakarta",
+    "emailVerified": true,
     "createdAt": "2026-11-07T10:00:00.000Z",
     "updatedAt": "2026-11-07T10:00:00.000Z"
   }
@@ -1326,18 +1462,37 @@ The server keeps no per-client history. After a reconnect:
 
 ## 10. End-to-end examples
 
-### 10.1 cURL: login and fetch the latest measurement
+### 10.1 cURL: register, verify, then fetch the latest measurement
 
 ```bash
 BASE=http://localhost:3000/api/v1
 
-ACCESS=$(curl -s -X POST "$BASE/auth/login" \
+# 1. Register. No tokens are returned yet.
+curl -s -X POST "$BASE/auth/register" \
   -H 'Content-Type: application/json' \
-  -d '{"email":"demo@medisense.local","password":"Demo1234!"}' \
+  -d '{"name":"Demo User","email":"new@medisense.local","password":"Demo1234!"}' | jq
+
+# 2. Read the 6-digit code from Mailpit (http://localhost:8025) when the
+#    Compose stack is used, or from the backend log with MAIL_TRANSPORT=console.
+OTP=123456
+
+# 3. Verify the email and receive tokens.
+ACCESS=$(curl -s -X POST "$BASE/auth/verify-email" \
+  -H 'Content-Type: application/json' \
+  -d "{\"email\":\"new@medisense.local\",\"otp\":\"$OTP\"}" \
   | jq -r '.data.tokens.accessToken')
 
 curl -s "$BASE/measurements/latest" \
   -H "Authorization: Bearer $ACCESS" | jq
+```
+
+The seeded demo account is already verified, so it can log in directly:
+
+```bash
+ACCESS=$(curl -s -X POST "$BASE/auth/login" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"demo@medisense.local","password":"Demo1234!"}' \
+  | jq -r '.data.tokens.accessToken')
 ```
 
 ### 10.2 cURL: pair the seeded demo device
@@ -1364,20 +1519,24 @@ After `npx prisma db seed`:
 | --- | --- |
 | User email | `demo@medisense.local` |
 | User password | `Demo1234!` |
+| User email status | Already verified, so login issues tokens immediately |
 | Device `ESP32-001` | Already paired with the demo user, intended for the simulator |
 | Device `ESP32-002` | Unpaired, pairing code `123456`, valid 30 days |
 | Alert thresholds | Heart rate 50–100, SpO2 95–100, temperature 36.1–37.5 |
 
 ### 10.4 Typical Flutter flow
 
-1. `POST /auth/login` → store access + refresh tokens securely.
-2. `GET /devices` → choose a device.
-3. Connect Socket.IO with `auth.token`, then `device:subscribe`.
-4. `GET /measurements/latest` and `GET /measurements/series` → bootstrap charts.
-5. Apply `measurement:update` events to the live chart.
-6. Listen for `alert:new` and `device:status`.
-7. Refresh the token before `expiresIn`; reconnect the socket with the new token.
-8. On app resume, re-fetch snapshots and unread alerts.
+1. `POST /auth/register` → read the OTP from email (Mailpit in development).
+2. `POST /auth/verify-email` → store access + refresh tokens securely.
+3. `GET /devices` → choose a device.
+4. Connect Socket.IO with `auth.token`, then `device:subscribe`.
+5. `GET /measurements/latest` and `GET /measurements/series` → bootstrap charts.
+6. Apply `measurement:update` events to the live chart.
+7. Listen for `alert:new` and `device:status`.
+8. Refresh the token before `expiresIn`; reconnect the socket with the new token.
+9. On app resume, re-fetch snapshots and unread alerts.
+10. If login returns `403 AUTH_EMAIL_NOT_VERIFIED`, show the verification screen
+    and offer `POST /auth/resend-verification` after the cooldown.
 
 ---
 

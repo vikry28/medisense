@@ -170,7 +170,17 @@ describe("EmailVerificationService", () => {
       });
     });
 
-    it("rejects missing or expired codes", async () => {
+    it("rejects missing codes as invalid", async () => {
+      const { service, prisma } = createService();
+      prisma.user.findUnique.mockResolvedValue(USER);
+      prisma.emailVerificationCode.findFirst.mockResolvedValue(null);
+
+      await expect(service.verify(USER.email, "123456")).rejects.toMatchObject({
+        code: "AUTH_OTP_INVALID",
+      });
+    });
+
+    it("rejects expired codes", async () => {
       const { service, prisma } = createService();
       prisma.user.findUnique.mockResolvedValue(USER);
       prisma.emailVerificationCode.findFirst.mockResolvedValue({
