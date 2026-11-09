@@ -17,6 +17,10 @@ jobs:
   quality:
     name: Format, build and unit tests
     runs-on: ubuntu-latest
+    env:
+      # Prisma validates that the schema references a configured URL even when
+      # these steps do not connect to a database.
+      DATABASE_URL: postgresql://medisense:medisense@localhost:5432/medisense?schema=public
     steps:
       - name: Checkout
         uses: actions/checkout@v4
