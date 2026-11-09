@@ -25,17 +25,6 @@ describeWithDatabase("MediSense HTTP API (e2e)", () => {
   const capturedMail: CapturedMail[] = [];
 
   beforeAll(async () => {
-    process.env.DATABASE_URL = TEST_DATABASE_URL;
-    process.env.MQTT_ENABLED = "false";
-    process.env.PAIRING_ALLOW_DEVICE_CODE = "true";
-    process.env.JWT_ACCESS_SECRET =
-      process.env.JWT_ACCESS_SECRET ??
-      "test-access-secret-change-me-at-least-32-chars";
-    process.env.PAIRING_CODE_PEPPER =
-      process.env.PAIRING_CODE_PEPPER ?? "test-pairing-pepper-change-me";
-    process.env.EMAIL_OTP_PEPPER =
-      process.env.EMAIL_OTP_PEPPER ?? "test-email-otp-pepper-change-me";
-
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
     })
