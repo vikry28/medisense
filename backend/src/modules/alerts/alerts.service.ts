@@ -4,6 +4,7 @@ import {
   AlertConfig,
   AlertParameter,
   AlertStatus,
+  Device,
   Measurement,
   Prisma,
 } from "@prisma/client";
@@ -167,6 +168,26 @@ export class AlertsService {
     return alerts;
   }
 
+  async createDeviceDisconnectedAlert(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    device: Pick<Device, "id" | "deviceCode">,
+  ): Promise<Alert> {
+    return tx.alert.create({
+      data: {
+        userId,
+        deviceId: device.id,
+        measurementId: null,
+        parameter: AlertParameter.DEVICE_CONNECTION,
+        value: null,
+        minValue: null,
+        maxValue: null,
+        direction: null,
+        message: `Device ${device.deviceCode} disconnected.`,
+      },
+    });
+  }
+
   async list(userId: string, query: ListAlertsQueryDto) {
     const limit = query.limit ?? 50;
     const from = query.from ? new Date(query.from) : undefined;
@@ -184,7 +205,7 @@ export class AlertsService {
       where.status = query.status as AlertStatus;
     }
     if (query.parameter) {
-      where.parameter = query.parameter as AlertParameter;
+      where.parameter = query.parameter;
     }
     if (from || to) {
       where.createdAt = {
@@ -286,7 +307,7 @@ export function toAlertDto(alert: Alert) {
     deviceId: alert.deviceId,
     measurementId: alert.measurementId,
     parameter: alert.parameter,
-    value: Number(alert.value),
+    value: alert.value === null ? null : Number(alert.value),
     minValue: alert.minValue === null ? null : Number(alert.minValue),
     maxValue: alert.maxValue === null ? null : Number(alert.maxValue),
     direction: alert.direction,

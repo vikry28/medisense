@@ -44,6 +44,9 @@ export const envValidationSchema = Joi.object({
   MQTT_CLIENT_ID: Joi.string().default("medisense-backend"),
   MQTT_TOPIC_PREFIX: Joi.string().default("medisense"),
   MQTT_REJECT_UNAUTHORIZED: Joi.boolean().default(true),
+  MQTT_CA_PATH: Joi.string().allow("").optional(),
+  MQTT_CERT_PATH: Joi.string().allow("").optional(),
+  MQTT_KEY_PATH: Joi.string().allow("").optional(),
 
   DEVICE_OFFLINE_THRESHOLD_SECONDS: Joi.number()
     .integer()

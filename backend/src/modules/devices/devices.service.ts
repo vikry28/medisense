@@ -1,13 +1,20 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { EventEmitter2 } from "@nestjs/event-emitter";
-import { Device, DeviceAssignment, DeviceStatus, Prisma } from "@prisma/client";
+import {
+  Alert,
+  Device,
+  DeviceAssignment,
+  DeviceStatus,
+  Prisma,
+} from "@prisma/client";
 import { randomInt } from "node:crypto";
 import { ERROR_CODES } from "../../common/constants";
 import { EVENTS } from "../../common/events";
 import { AppException } from "../../common/errors/app.exception";
 import { hmacSha256, safeEqualHex } from "../../common/utils/hash";
 import { PrismaService } from "../../prisma/prisma.service";
+import { AlertsService, toAlertDto } from "../alerts/alerts.service";
 import { PairDeviceDto } from "./dto/pair-device.dto";
 import { UpdateDeviceDto } from "./dto/update-device.dto";
 
@@ -31,6 +38,7 @@ export class DevicesService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly events: EventEmitter2,
+    private readonly alertsService: AlertsService,
   ) {
     this.pairingPepper = this.config.getOrThrow<string>("PAIRING_CODE_PEPPER");
     this.pairingTtlMinutes = this.config.get<number>(
@@ -290,14 +298,17 @@ export class DevicesService {
       return;
     }
 
-    const device = await this.prisma.device.update({
-      where: { id: deviceId },
-      data: { status: DeviceStatus.OFFLINE },
-    });
+    const userId = current.assignments[0]?.userId ?? null;
+    const result = await this.transitionOffline(deviceId, userId);
+    if (!result) {
+      return;
+    }
 
-    const userId = current.assignments[0]?.userId;
-    if (userId && current.status !== DeviceStatus.OFFLINE) {
-      this.emitStatus(userId, device);
+    if (userId) {
+      this.emitStatus(userId, result.device);
+      if (result.alert) {
+        this.emitAlert(userId, result.alert);
+      }
     }
   }
 
@@ -314,13 +325,28 @@ export class DevicesService {
       return null;
     }
 
+    if (payload.status === DeviceStatus.OFFLINE) {
+      const offline = await this.transitionOffline(
+        device.id,
+        assignment.userId,
+        payload.firmwareVersion,
+      );
+      if (!offline) {
+        return { device: device, userId: assignment.userId };
+      }
+
+      this.emitStatus(assignment.userId, offline.device);
+      if (offline.alert) {
+        this.emitAlert(assignment.userId, offline.alert);
+      }
+      return { device: offline.device, userId: assignment.userId };
+    }
+
     const updated = await this.prisma.device.update({
       where: { id: device.id },
       data: {
-        status: payload.status,
-        ...(payload.status === DeviceStatus.ONLINE
-          ? { lastSeenAt: new Date() }
-          : {}),
+        status: DeviceStatus.ONLINE,
+        lastSeenAt: new Date(),
         ...(payload.firmwareVersion
           ? { firmwareVersion: payload.firmwareVersion }
           : {}),
@@ -343,19 +369,60 @@ export class DevicesService {
 
     let updatedCount = 0;
     for (const device of stale) {
-      const updated = await this.prisma.device.update({
-        where: { id: device.id },
-        data: { status: DeviceStatus.OFFLINE },
-      });
+      const userId = device.assignments[0]?.userId ?? null;
+      const result = await this.transitionOffline(device.id, userId);
+      if (!result) {
+        continue;
+      }
       updatedCount += 1;
 
-      const userId = device.assignments[0]?.userId;
       if (userId) {
-        this.emitStatus(userId, updated);
+        this.emitStatus(userId, result.device);
+        if (result.alert) {
+          this.emitAlert(userId, result.alert);
+        }
       }
     }
 
     return updatedCount;
+  }
+
+  /**
+   * Atomically moves a device from ONLINE to OFFLINE. The conditional update
+   * guarantees that concurrent triggers (LWT, sweeper, manual status) produce
+   * exactly one offline transition and therefore at most one notification.
+   */
+  private async transitionOffline(
+    deviceId: string,
+    userId: string | null,
+    firmwareVersion?: string,
+  ): Promise<{ device: Device; alert: Alert | null } | null> {
+    return this.prisma.$transaction(async (tx) => {
+      const transition = await tx.device.updateMany({
+        where: { id: deviceId, status: DeviceStatus.ONLINE },
+        data: {
+          status: DeviceStatus.OFFLINE,
+          ...(firmwareVersion ? { firmwareVersion } : {}),
+        },
+      });
+      if (transition.count === 0) {
+        return null;
+      }
+
+      const device = await tx.device.findUniqueOrThrow({
+        where: { id: deviceId },
+      });
+      if (!userId) {
+        return { device, alert: null };
+      }
+
+      const alert = await this.alertsService.createDeviceDisconnectedAlert(
+        tx,
+        userId,
+        device,
+      );
+      return { device, alert };
+    });
   }
 
   hashPairingCode(deviceCode: string, pairingCode: string): string {
@@ -374,6 +441,13 @@ export class DevicesService {
       status: device.status,
       lastSeenAt: device.lastSeenAt,
     } satisfies DeviceStatusEvent);
+  }
+
+  private emitAlert(userId: string, alert: Alert): void {
+    this.events.emit(EVENTS.ALERT_CREATED, {
+      userId,
+      alert: toAlertDto(alert),
+    });
   }
 }
 

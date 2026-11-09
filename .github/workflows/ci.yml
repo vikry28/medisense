@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  quality:
+    name: Format, build and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: backend/.nvmrc
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Validate Prisma schema
+        run: npx prisma validate
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test -- --runInBand
+
+  e2e:
+    name: API e2e (PostgreSQL 18)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: medisense
+          POSTGRES_PASSWORD: medisense
+          POSTGRES_DB: medisense_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U medisense -d medisense_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://medisense:medisense@localhost:5432/medisense_test?schema=public
+      TEST_DATABASE_URL: postgresql://medisense:medisense@localhost:5432/medisense_test?schema=public
+      JWT_ACCESS_SECRET: test-access-secret-change-me-at-least-32-chars
+      PAIRING_CODE_PEPPER: test-pairing-pepper-change-me
+      EMAIL_OTP_PEPPER: test-email-otp-pepper-change-me
+      MQTT_ENABLED: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: backend/.nvmrc
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Apply migrations
+        run: npx prisma migrate deploy
+
+      - name: API e2e tests
+        run: npm run test:e2e

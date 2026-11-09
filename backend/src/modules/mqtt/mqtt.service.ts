@@ -7,6 +7,7 @@ import {
 import { ConfigService } from "@nestjs/config";
 import { DeviceStatus } from "@prisma/client";
 import { connect, IClientOptions, MqttClient } from "mqtt";
+import { readFileSync } from "node:fs";
 import { DevicesService } from "../devices/devices.service";
 import {
   MeasurementIngestionService,
@@ -56,6 +57,7 @@ export class MqttService implements OnModuleInit, OnApplicationShutdown {
         true,
       ),
     };
+    this.loadTlsMaterial(options);
 
     const url = this.config.get<string>("MQTT_URL", "mqtt://localhost:1883");
     this.logger.log(`Connecting to MQTT broker at ${url}`);
@@ -108,6 +110,32 @@ export class MqttService implements OnModuleInit, OnApplicationShutdown {
 
   isConnected(): boolean {
     return this.client?.connected ?? false;
+  }
+
+  private loadTlsMaterial(options: IClientOptions): void {
+    const caPath = this.config.get<string>("MQTT_CA_PATH");
+    const certPath = this.config.get<string>("MQTT_CERT_PATH");
+    const keyPath = this.config.get<string>("MQTT_KEY_PATH");
+
+    if (caPath) {
+      options.ca = this.readTlsFile("MQTT_CA_PATH", caPath);
+    }
+    if (certPath) {
+      options.cert = this.readTlsFile("MQTT_CERT_PATH", certPath);
+    }
+    if (keyPath) {
+      options.key = this.readTlsFile("MQTT_KEY_PATH", keyPath);
+    }
+  }
+
+  private readTlsFile(name: string, path: string): Buffer {
+    try {
+      return readFileSync(path);
+    } catch (error) {
+      throw new Error(
+        `Unable to read ${name} at "${path}": ${(error as Error).message}`,
+      );
+    }
   }
 
   private async handleMessage(topic: string, raw: Buffer): Promise<void> {

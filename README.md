@@ -51,7 +51,7 @@ Then:
 - REST API: <http://localhost:3000/api/v1>
 - Swagger: <http://localhost:3000/docs>
 - Readiness: <http://localhost:3000/health/ready>
-- MQTT broker: `mqtt://localhost:1883`
+- MQTT broker over TLS: `mqtts://localhost:8883` (plaintext `mqtt://localhost:1883` is for local debugging)
 - Mailpit (verification emails): <http://localhost:8025>
 
 New accounts must verify their email with a 6-digit code before they can log in.
@@ -75,11 +75,14 @@ demo user. `ESP32-002` is unpaired with pairing code `123456`.
 - User profile and password management
 - Device pairing, pairing-code regeneration, rename and unpair
 - MQTT telemetry ingestion with validation, idempotency and presence tracking
+- MQTT over TLS (listener 8883) with a generated development CA
 - Measurement history, latest value and bucketed chart series
-- Per-user alert thresholds, alert history and read state
+- Per-user alert thresholds, abnormal-value alerts and device disconnected alerts
+- Alert history and read state
 - Socket.IO real-time measurement, device-status and alert events
 - PostgreSQL schema, migrations, seed and Docker Compose stack
 - Health probes, structured logging, rate limiting and Swagger
+- Unit tests plus PostgreSQL-backed API e2e tests, run in GitHub Actions
 
 Not implemented in this milestone: PDF export, push notifications,
 caregiver/admin workflows, MQTT simulator and ESP32 firmware.

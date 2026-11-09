@@ -19,9 +19,10 @@ MQTT contracts live in [`api-specification.md`](./api-specification.md).
 | PostgreSQL schema + migrations + seed | Implemented |
 | MQTT ingestion (telemetry + device status/LWT) | Implemented |
 | Socket.IO real-time gateway | Implemented |
-| Docker Compose (PostgreSQL, Mailpit, Mosquitto, backend) | Implemented |
+| Docker Compose (PostgreSQL, Mailpit, Mosquitto with TLS, backend) | Implemented |
 | Unit tests | Implemented |
-| Database-backed e2e tests | Spec included, opt-in via `TEST_DATABASE_URL` |
+| Database-backed API e2e tests | Implemented, opt-in locally via `TEST_DATABASE_URL`; run in GitHub Actions |
+| CI (format, build, unit, e2e) | Implemented in `.github/workflows/ci.yml` |
 | PDF export, push notifications, caregiver/admin | Out of scope |
 | MQTT simulator application | Next milestone |
 | ESP32 firmware | Next milestone |
@@ -29,7 +30,8 @@ MQTT contracts live in [`api-specification.md`](./api-specification.md).
 The backend is a single NestJS 11 application. It exposes three entry points:
 
 1. **HTTP** on `:3000` under `/api/v1` (plus `/health/*` and `/docs`).
-2. **MQTT client** connected to Mosquitto on `:1883`.
+2. **MQTT client** connected to Mosquitto over TLS on `:8883`
+   (`mqtts://`); a plaintext `:1883` listener exists for local debugging.
 3. **Socket.IO** namespace `/realtime` on the same HTTP server.
 
 ---
@@ -127,9 +129,9 @@ API and never receive user tokens.
 | `AuthModule` | Register, email OTP verification, login, refresh rotation, logout, JWT signing |
 | `MailModule` | Console/SMTP delivery of verification emails |
 | `UsersModule` | Profile read/update, password change |
-| `DevicesModule` | Pairing, unpairing, rename, presence sweeper |
+| `DevicesModule` | Pairing, unpairing, rename, presence sweeper, device connection alerts |
 | `MeasurementsModule` | Telemetry ingestion, history, latest, series |
-| `AlertsModule` | Threshold configuration, evaluation, alert history |
+| `AlertsModule` | Threshold configuration, evaluation, alert history, device connection alerts |
 | `MqttModule` | Broker connection, topic routing, status handling |
 | `RealtimeModule` | Socket.IO authentication, rooms, event fan-out |
 | `HealthModule` | Liveness and readiness probes |
@@ -239,6 +241,16 @@ Default thresholds (seeded and used as fallback when a row is missing):
 
 Thresholds are a demonstration feature, not a clinical alarm system.
 
+**Device connection alerts.** When a paired device transitions from `ONLINE` to
+`OFFLINE` (MQTT Last Will, an explicit `offline` status, or the presence
+sweeper), the backend writes an `alerts` row with
+`parameter = DEVICE_CONNECTION`. The row has no measurement, numeric value or
+direction, so those columns are nullable. The transition is performed with a
+conditional `UPDATE ... WHERE status = 'ONLINE'` inside the same transaction as
+the alert insert; concurrent triggers therefore produce exactly one alert per
+outage. User-initiated unpairing does not create a disconnected alert. The alert
+is returned by `GET /alerts` and pushed as `alert:new`.
+
 ### 4.3 Authentication, email verification and session rotation
 
 ```mermaid
@@ -343,12 +355,23 @@ sequenceDiagram
   `HMAC-SHA256("<deviceCode>:<code>", PAIRING_CODE_PEPPER)` with an expiry.
 - A partial unique index guarantees at most **one active assignment per
   device**.
-- Unpairing sets `unassigned_at` and marks the device offline. Measurements and
-  alerts keep their `user_id`, so history is preserved.
+- Unpairing sets `unassigned_at` and marks the device offline (no disconnected
+  alert is created because the user initiated it). Measurements and alerts keep
+  their `user_id`, so history is preserved.
 - A user who previously paired a device may request a new code after unpairing
   via `POST /devices/:id/pairing-code`.
 - For local development only, `PAIRING_ALLOW_DEVICE_CODE=true` allows pairing
   with `deviceCode` alone (no code). It must be `false` in production.
+- **Device discovery is out of scope for the backend.** Scanning for nearby
+  BLE/ESP32 devices and showing them in the app belongs to the Flutter client
+  (with firmware support for advertising). The backend only pairs a known
+  `deviceCode`, so discovery never grants access: pairing still requires the
+  device row and, outside development pairing, a valid pairing code.
+- **MQTT credentials are provisioned manually.** This milestone has no device
+  provisioning API. Adding a physical device means creating its row (seed or
+  database), adding a broker user to the `mosquitto-init` password file, and
+  giving the firmware the generated username/password. The ACL limits each
+  device to its own topics.
 
 ### 4.5 Presence and offline detection
 
@@ -363,7 +386,10 @@ Two independent mechanisms keep `devices.status` accurate:
    `DEVICE_OFFLINE_THRESHOLD_SECONDS` (default 90 s) as `OFFLINE`.
 
 Every telemetry message also refreshes `last_seen_at` and sets the device
-`ONLINE`. Status changes are emitted as `device:status` to the owner's room.
+`ONLINE`. Status changes are emitted as `device:status` to the owner's room. An
+`ONLINE → OFFLINE` transition is applied with a conditional update in the same
+transaction that inserts one `DEVICE_CONNECTION` alert, which deduplicates
+concurrent LWT/sweeper triggers and also emits `alert:new`.
 
 ### 4.6 WebSocket fan-out
 
@@ -589,12 +615,12 @@ erDiagram
     uuid id PK
     uuid user_id FK
     uuid device_id FK
-    uuid measurement_id FK
+    uuid measurement_id FK?   // null for DEVICE_CONNECTION alerts
     enum parameter
-    decimal value
+    decimal value?            // null for DEVICE_CONNECTION alerts
     decimal min_value
     decimal max_value
-    enum direction
+    enum direction?           // null for DEVICE_CONNECTION alerts
     enum status
     varchar message
     timestamptz created_at
@@ -633,7 +659,10 @@ CREATE UNIQUE INDEX "device_assignments_active_device_unique"
 Duplicate MQTT deliveries (QoS 1 is at-least-once) are ignored.
 
 **Alert deduplication.** `@@unique([measurementId, parameter])` prevents two
-alerts for the same parameter on the same measurement.
+threshold alerts for the same parameter on the same measurement. Device
+connection alerts have a `NULL` measurement id (PostgreSQL treats `NULL`s as
+distinct) and are deduplicated by the atomic `ONLINE → OFFLINE` status
+transition instead.
 
 **Indexes.** Descending composite indexes on
 `(user_id, measured_at)`, `(device_id, measured_at)` and
@@ -657,13 +686,13 @@ on `(user_id, heart_rate)` and `(user_id, spo2)` support future filtering.
 | Pairing codes | HMAC-SHA256 with pepper, expiry, cleared after use |
 | Authorization | Every device/measurement/alert query scoped by `user_id` |
 | Cross-account access | Returns `404` (does not reveal resource existence) |
-| MQTT | Username/password, ACL, per-device topic restriction, TLS in production |
+| MQTT | Username/password, ACL, per-device topic restriction, TLS listener (8883) with CA verification |
 | WebSocket | JWT verified during handshake; room joins authorize device ownership |
 | Input validation | DTO validation, telemetry range/timestamp checks, 64 KB body limit |
 | Rate limiting | Global 100 req/min/IP; stricter auth limits |
 | Headers | Helmet, CORS allowlist |
 | Logging | pino redaction of auth headers, cookies, passwords, refresh tokens |
-| Transport | TLS terminated at a reverse proxy in production; MQTT over TLS |
+| Transport | HTTP TLS terminated at a reverse proxy in production; MQTT over TLS (8883) in the Compose stack |
 
 Security notes and deliberate trade-offs:
 
@@ -676,8 +705,9 @@ Security notes and deliberate trade-offs:
   unique client IDs and shared subscriptions.
 - Socket.IO rooms are in-memory. Multi-instance deployments need the Socket.IO
   Redis adapter.
-- MQTT rejects unencrypted connections in production via a TLS listener; the
-  development Compose stack uses plaintext on localhost only.
+- The Compose stack exposes MQTT over TLS on 8883 with a generated development
+  CA, and the backend validates the broker certificate. A plaintext listener on
+  1883 is kept for local debugging only and must be removed in production.
 - The seed creates known development credentials. Never use them outside local
   development.
 
@@ -692,7 +722,7 @@ Security notes and deliberate trade-offs:
 | MQTT broker unavailable | Client reconnects every 5 s with backoff; REST/WS stay up; readiness reports `degraded` |
 | Invalid MQTT payload | Logged and dropped; ingestion stays healthy |
 | Duplicate telemetry | Ignored via unique `(device_id, message_id)` |
-| Device disconnects | LWT marks it offline; sweeper is the fallback |
+| Device disconnects | LWT marks it offline; sweeper is the fallback; one `DEVICE_CONNECTION` alert is created per online → offline transition |
 | Refresh token reuse | Entire token family revoked; client must log in again |
 | Mail provider unavailable | Verification email failure is logged; registration/resend still succeed and the client can retry |
 | WebSocket disconnect | Client reconnects and re-subscribes; no server-side state is lost |
@@ -711,15 +741,20 @@ flowchart TB
   subgraph Docker["Docker Compose network: medisense"]
     PG[("postgres:18-alpine<br/>volume postgres-data<br/>host :5433")]
     MINIT["mosquitto-init<br/>one-shot password file"]
-    MQ["eclipse-mosquitto:2<br/>host :1883"]
+    CINIT["mosquitto-cert-init<br/>one-shot development CA + server cert"]
+    CERTS[("volume mosquitto-certs")]
+    MQ["eclipse-mosquitto:2<br/>host :1883 plaintext<br/>host :8883 TLS"]
     MAIL["mailpit<br/>SMTP :1025<br/>UI :8025"]
     BE["backend<br/>multi-stage Node 26<br/>host :3000"]
   end
-  DEV["ESP32 / simulator"] --> MQ
-  BE --> MQ
+  DEV["ESP32 / simulator"] -->|"MQTT over TLS"| MQ
+  BE -->|"mqtts://mosquitto:8883"| MQ
   BE --> PG
   BE --> MAIL
   MINIT --> MQ
+  CINIT --> CERTS
+  CERTS --> MQ
+  CERTS --> BE
   USER["Flutter / browser / curl"] --> BE
   USER --> MAIL
 ```
@@ -731,7 +766,8 @@ flowchart TB
 | `postgres` | `postgres:18-alpine` | `5433:5432` | Healthcheck via `pg_isready`; named volume |
 | `mailpit` | `axllent/mailpit:latest` | `1025:1025`, `8025:8025` | Development SMTP sink and web UI for verification emails |
 | `mosquitto-init` | `eclipse-mosquitto:2` | none | Generates `passwd` from env, exits |
-| `mosquitto` | `eclipse-mosquitto:2` | `1883:1883` | Config, ACL and passwd mounted read-only |
+| `mosquitto-cert-init` | `alpine:3.24` | none | Generates a development CA and server certificate into `mosquitto-certs`, exits |
+| `mosquitto` | `eclipse-mosquitto:2` | `1883:1883`, `8883:8883` | Config, ACL, passwd and certificates mounted read-only; TLS listener on 8883 |
 | `backend` | built from `backend/Dockerfile` | `3000:3000` | Runs `prisma migrate deploy` then `node dist/main.js` |
 
 The host PostgreSQL port defaults to **5433** to avoid clashing with an existing
@@ -762,6 +798,10 @@ manual (`docker compose exec backend npx prisma db seed`).
 
 - `allow_anonymous false`
 - password file generated by `mosquitto-init`
+- TLS listener on `8883` using `ca.crt`, `server.crt` and `server.key` from the
+  `mosquitto-certs` volume (generated once by `mosquitto-cert-init`, SANs for
+  `mosquitto`, `localhost` and `127.0.0.1`)
+- plaintext listener on `1883` retained for local debugging only
 - ACL:
   - `medi-backend`: read all `telemetry`/`status`, write `command`
   - devices: write only `medisense/device/%u/telemetry|status`, read
@@ -776,8 +816,9 @@ manual (`docker compose exec backend npx prisma db seed`).
 - Do not expose Mailpit publicly; use a real SMTP provider over TLS and remove
   the `mailpit` service from production deployments.
 - Set `PAIRING_ALLOW_DEVICE_CODE=false`.
-- Terminate TLS at a reverse proxy; use `mqtts://` and set
-  `MQTT_REJECT_UNAUTHORIZED=true`.
+- Terminate HTTP TLS at a reverse proxy.
+- Replace the generated development CA and server certificate with a real CA;
+  remove the plaintext `1883` listener and keep `MQTT_REJECT_UNAUTHORIZED=true`.
 - Use a managed PostgreSQL with backups and retention policies.
 - Add the Socket.IO Redis adapter and a shared rate-limit store.
 - Give each backend replica a unique `MQTT_CLIENT_ID` and use shared
@@ -794,11 +835,11 @@ manual (`docker compose exec backend npx prisma db seed`).
 | UI update ≤ 500 ms after client receives event | In-process event bus + Socket.IO push; typical latency is dominated by network |
 | WebSocket reconnection | Client-side responsibility; server accepts reconnects and re-subscribes |
 | JWT authentication and per-device authorization | Global JWT guard + `user_id` scoping + gateway ownership checks |
-| MQTT over TLS | Supported via `mqtts://` and `MQTT_REJECT_UNAUTHORIZED`; dev uses plaintext |
+| MQTT over TLS | TLS listener on 8883 with a generated development CA; the backend uses `mqtts://` and validates the CA. Plaintext 1883 is debug-only |
 | Payload and timestamp validation | class-validator + explicit telemetry window checks |
 | Scalability | Stateless HTTP/WS app; documented Redis adapter/shared-subscription path |
 | Modular architecture | NestJS feature modules with typed, decoupled events |
-| Unit, integration and API tests | Jest unit tests + opt-in database e2e suite |
+| Unit, integration and API tests | Jest unit tests + PostgreSQL-backed API e2e suite, both run in GitHub Actions (e2e remains opt-in locally via `TEST_DATABASE_URL`) |
 | Logging and connection status | pino request logs, MQTT lifecycle logs, `/health/ready` |
 | Recovery after network interruption | MQTT reconnect loop, LWT/sweeper, client reconnect |
 | No cross-account data access | Every query scoped by `user_id`; `404` on foreign resources |

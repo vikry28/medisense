@@ -45,6 +45,15 @@ services:
         chmod 644 /auth/passwd
         echo "Mosquitto password file generated."
 
+  mosquitto-cert-init:
+    image: alpine:3.24
+    user: root
+    restart: "no"
+    volumes:
+      - mosquitto-certs:/mosquitto/certs
+      - ./mosquitto/generate-certs.sh:/usr/local/bin/generate-certs.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/generate-certs.sh"]
+
   mailpit:
     image: axllent/mailpit:latest
     restart: unless-stopped
@@ -58,12 +67,16 @@ services:
     depends_on:
       mosquitto-init:
         condition: service_completed_successfully
+      mosquitto-cert-init:
+        condition: service_completed_successfully
     ports:
       - "${MQTT_PORT:-1883}:1883"
+      - "${MQTT_TLS_PORT:-8883}:8883"
     volumes:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ./mosquitto/acl:/mosquitto/config/acl:ro
       - mosquitto-auth:/mosquitto/auth:ro
+      - mosquitto-certs:/mosquitto/certs:ro
       - mosquitto-data:/mosquitto/data
       - mosquitto-log:/mosquitto/log
 
@@ -79,6 +92,8 @@ services:
         condition: service_started
       mosquitto:
         condition: service_started
+      mosquitto-cert-init:
+        condition: service_completed_successfully
     environment:
       NODE_ENV: production
       PORT: 3000
@@ -105,19 +120,23 @@ services:
       SMTP_SECURE: "false"
       SMTP_FROM: "${SMTP_FROM:-MediSense <no-reply@medisense.local>}"
       MQTT_ENABLED: "true"
-      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_URL: mqtts://mosquitto:8883
       MQTT_USERNAME: medi-backend
       MQTT_PASSWORD: ${MQTT_BACKEND_PASSWORD:-backend-secret}
       MQTT_CLIENT_ID: medisense-backend
       MQTT_TOPIC_PREFIX: medisense
-      MQTT_REJECT_UNAUTHORIZED: "false"
+      MQTT_REJECT_UNAUTHORIZED: "true"
+      MQTT_CA_PATH: /mosquitto/certs/ca.crt
       DEVICE_OFFLINE_THRESHOLD_SECONDS: ${DEVICE_OFFLINE_THRESHOLD_SECONDS:-90}
       DEVICE_SWEEPER_INTERVAL_MS: ${DEVICE_SWEEPER_INTERVAL_MS:-30000}
+    volumes:
+      - mosquitto-certs:/mosquitto/certs:ro
     ports:
       - "${BACKEND_PORT:-3000}:3000"
 
 volumes:
   postgres-data:
   mosquitto-auth:
+  mosquitto-certs:
   mosquitto-data:
   mosquitto-log:

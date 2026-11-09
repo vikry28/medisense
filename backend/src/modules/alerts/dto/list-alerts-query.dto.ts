@@ -1,3 +1,4 @@
+import { AlertParameter } from "@prisma/client";
 import { Type } from "class-transformer";
 import {
   IsDateString,
@@ -8,7 +9,6 @@ import {
   Max,
   Min,
 } from "class-validator";
-import { AlertParameterKey } from "../alert-evaluator";
 
 export enum AlertStatusFilter {
   UNREAD = "UNREAD",
@@ -21,8 +21,8 @@ export class ListAlertsQueryDto {
   status?: AlertStatusFilter;
 
   @IsOptional()
-  @IsEnum(AlertParameterKey)
-  parameter?: AlertParameterKey;
+  @IsEnum(AlertParameter)
+  parameter?: AlertParameter;
 
   @IsOptional()
   @IsDateString()
