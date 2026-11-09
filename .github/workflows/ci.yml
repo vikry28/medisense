@@ -23,10 +23,10 @@ jobs:
       DATABASE_URL: postgresql://medisense:medisense@localhost:5432/medisense?schema=public
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: backend/.nvmrc
           cache: npm
@@ -76,10 +76,10 @@ jobs:
       MQTT_ENABLED: "false"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: backend/.nvmrc
           cache: npm
